@@ -1,0 +1,215 @@
+#!/bin/bash
+# instalar.sh - Arma todo el servidor del Práctico Final de una sola vez
+# Uso: sudo bash instalar.sh   (en la misma carpeta que menu.sh, usuarios.sh, deploy.sh y backup.sh)
+
+# --- FUNCIONES DE FORMATO ---
+ANCHO=$(tput cols 2>/dev/null || echo 80)
+
+linea() {
+    printf '%*s\n' "$ANCHO" '' | tr ' ' '_'
+}
+
+centrar() {
+    local texto="$1"
+    local longitud=${#texto}
+
+    if [ "$longitud" -ge "$ANCHO" ]; then
+        printf "%s\n" "$texto"
+    else
+        local espacios=$(( (ANCHO - longitud) / 2 ))
+        printf "%*s%s\n" "$espacios" "" "$texto"
+    fi
+}
+
+# Muestra el título de cada paso
+paso() {
+    echo
+    linea
+    centrar "$1"
+    linea
+}
+
+ok()    { echo "  [OK]    $1"; }
+fallo() { echo "  [ERROR] $1"; echo; centrar "La instalación se detuvo. Corregí el error y volvé a correr el script."; exit 1; }
+
+# --- CONFIGURACIÓN ---
+DOMINIO="miproyecto.com"
+DIR_APP="/var/www/miproyecto"
+DB_NAME="peluqueria"
+DB_USER="peluqueria_app"
+CRON="0 0 * * 6 /usr/local/bin/backup.sh"
+CARPETA=$(cd "$(dirname "$0")" && pwd)
+
+# ==================== CONTROLES INICIALES ====================
+clear
+linea
+centrar "INSTALACIÓN AUTOMÁTICA - TAREA FINAL"
+centrar "$DOMINIO"
+linea
+echo
+
+if [ "$(id -u)" -ne 0 ]; then
+    centrar "Error: ejecutá el script con sudo (sudo bash instalar.sh)"
+    exit 1
+fi
+
+for s in menu.sh usuarios.sh deploy.sh backup.sh; do
+    [ -f "$CARPETA/$s" ] || fallo "Falta $s en $CARPETA (tiene que estar al lado de instalar.sh)"
+done
+
+# ==================== DATOS (se piden todos al principio) ====================
+echo "Contestá estas preguntas y después la instalación sigue sola."
+echo "Lo que está entre [corchetes] es el valor por defecto: con ENTER lo aceptás."
+echo
+read -p "URL del repo de GitHub (https://github.com/USUARIO/tarea-final.git): " REPO
+[ -n "$REPO" ] || fallo "La URL del repo es obligatoria"
+
+read -s -p "Clave del usuario de la base para la app [Peluqueria2026]: " DB_PASS; echo
+DB_PASS=${DB_PASS:-Peluqueria2026}
+read -s -p "Clave del usuario 'admin' de phpMyAdmin [Admin2026]: " ADMIN_PASS; echo
+ADMIN_PASS=${ADMIN_PASS:-Admin2026}
+
+echo
+echo "Backblaze (dejá el bucket vacío si todavía no tenés la cuenta; se puede hacer después)"
+read -p "Nombre del bucket: " BUCKET
+if [ -n "$BUCKET" ]; then
+    read -p "keyID: " KEY_ID
+    read -s -p "applicationKey: " APP_KEY; echo
+fi
+
+# ==================== 1. SISTEMA ====================
+paso "1/9 · ACTUALIZAR EL SISTEMA Y LA ZONA HORARIA"
+export DEBIAN_FRONTEND=noninteractive
+timedatectl set-timezone America/Montevideo && ok "Zona horaria: America/Montevideo"
+apt-get update -q || fallo "No se pudo actualizar la lista de paquetes (¿hay internet?)"
+apt-get upgrade -y -q || fallo "Falló la actualización del sistema"
+ok "Sistema actualizado"
+
+# ==================== 2. APACHE + PHP ====================
+paso "2/9 · APACHE CON DEPENDENCIAS PARA PHP"
+apt-get install -y -q apache2 php libapache2-mod-php php-mysql || fallo "No se pudo instalar Apache/PHP"
+systemctl enable --now apache2 > /dev/null 2>&1
+ok "Apache y PHP instalados y andando"
+
+# ==================== 3. MARIADB ====================
+paso "3/9 · MARIADB (MYSQL) Y LA BASE DE LA APP"
+apt-get install -y -q mariadb-server || fallo "No se pudo instalar MariaDB"
+systemctl enable --now mariadb > /dev/null 2>&1
+
+# Lo mismo que mariadb-secure-installation: sin usuarios anónimos ni base de prueba
+mariadb -e "DROP USER IF EXISTS ''@'localhost'; DROP USER IF EXISTS ''@'$(hostname)'; DROP DATABASE IF EXISTS test;"
+
+mariadb <<EOF || fallo "No se pudo crear la base de datos"
+CREATE DATABASE IF NOT EXISTS $DB_NAME CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+CREATE USER IF NOT EXISTS '$DB_USER'@'localhost' IDENTIFIED BY '$DB_PASS';
+ALTER USER '$DB_USER'@'localhost' IDENTIFIED BY '$DB_PASS';
+GRANT SELECT, INSERT, UPDATE, DELETE ON $DB_NAME.* TO '$DB_USER'@'localhost';
+CREATE USER IF NOT EXISTS 'admin'@'localhost' IDENTIFIED BY '$ADMIN_PASS';
+ALTER USER 'admin'@'localhost' IDENTIFIED BY '$ADMIN_PASS';
+GRANT ALL PRIVILEGES ON *.* TO 'admin'@'localhost' WITH GRANT OPTION;
+USE $DB_NAME;
+CREATE TABLE IF NOT EXISTS turnos (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    cliente VARCHAR(100) NOT NULL,
+    telefono VARCHAR(20) NOT NULL,
+    servicio VARCHAR(50) NOT NULL,
+    fecha DATE NOT NULL,
+    hora TIME NOT NULL
+);
+EOF
+ok "Base '$DB_NAME', tabla 'turnos' y usuarios '$DB_USER' y 'admin' listos"
+
+# ==================== 4. PHPMYADMIN ====================
+paso "4/9 · PHPMYADMIN"
+# Contesta de antemano las pantallas azules (elige apache2 y configura su base)
+debconf-set-selections <<EOF
+phpmyadmin phpmyadmin/reconfigure-webserver multiselect apache2
+phpmyadmin phpmyadmin/dbconfig-install boolean true
+phpmyadmin phpmyadmin/mysql/app-pass password $ADMIN_PASS
+phpmyadmin phpmyadmin/app-password-confirm password $ADMIN_PASS
+EOF
+apt-get install -y -q phpmyadmin || fallo "No se pudo instalar phpMyAdmin"
+if [ ! -e /etc/apache2/conf-enabled/phpmyadmin.conf ]; then
+    ln -sf /etc/phpmyadmin/apache.conf /etc/apache2/conf-available/phpmyadmin.conf
+    a2enconf phpmyadmin > /dev/null
+fi
+ok "phpMyAdmin en http://$DOMINIO/phpmyadmin (usuario admin)"
+
+# ==================== 5. GIT + CÓDIGO ====================
+paso "5/9 · GIT Y EL CÓDIGO DESDE GITHUB"
+apt-get install -y -q git || fallo "No se pudo instalar Git"
+if [ -d "$DIR_APP/.git" ]; then
+    ok "El repo ya estaba clonado en $DIR_APP"
+else
+    git clone "$REPO" "$DIR_APP" || fallo "No se pudo clonar $REPO (¿la URL está bien y el repo es público?)"
+    ok "Repo clonado en $DIR_APP"
+fi
+
+# config.php con la clave real: solo existe en el servidor y solo lo lee Apache
+cp "$DIR_APP/config/config.example.php" "$DIR_APP/config/config.php"
+sed -i "s/PONER_LA_CLAVE_ACA/$DB_PASS/" "$DIR_APP/config/config.php"
+chown root:www-data "$DIR_APP/config/config.php"
+chmod 640 "$DIR_APP/config/config.php"
+ok "config.php creado (root:www-data, 640)"
+
+# ==================== 6. DOMINIO ====================
+paso "6/9 · DOMINIO $DOMINIO A LOCALHOST"
+cat > /etc/apache2/sites-available/miproyecto.conf <<EOF
+<VirtualHost *:80>
+    ServerName $DOMINIO
+    DocumentRoot $DIR_APP/public
+
+    <Directory $DIR_APP/public>
+        AllowOverride All
+        Require all granted
+    </Directory>
+
+    ErrorLog \${APACHE_LOG_DIR}/miproyecto_error.log
+    CustomLog \${APACHE_LOG_DIR}/miproyecto_access.log combined
+</VirtualHost>
+EOF
+a2ensite miproyecto.conf > /dev/null
+apache2ctl configtest 2>&1 | grep -q "Syntax OK" || fallo "Error en la configuración de Apache (apache2ctl configtest)"
+systemctl reload apache2
+grep -q " $DOMINIO" /etc/hosts || echo "127.0.0.1 $DOMINIO" >> /etc/hosts
+curl -s "http://$DOMINIO" | grep -q "Peluquería" || fallo "El dominio no responde con la app"
+ok "VirtualHost activo y $DOMINIO -> 127.0.0.1"
+
+# ==================== 7. SCRIPTS ====================
+paso "7/9 · SCRIPTS (MENÚ, USUARIOS, GIT PULL, RESPALDO)"
+for s in menu.sh usuarios.sh deploy.sh backup.sh; do
+    sed 's/\r$//' "$CARPETA/$s" > "/usr/local/bin/$s"
+    chmod 755 "/usr/local/bin/$s"
+done
+[ -n "$BUCKET" ] && sed -i "s/^BUCKET=.*/BUCKET=\"$BUCKET\"/" /usr/local/bin/backup.sh
+ok "Scripts instalados en /usr/local/bin (sudo menu.sh)"
+
+# ==================== 8. BACKBLAZE + RCLONE ====================
+paso "8/9 · RCLONE Y BACKBLAZE B2"
+apt-get install -y -q rclone || fallo "No se pudo instalar rclone"
+if [ -n "$BUCKET" ]; then
+    rclone config create b2 b2 account "$KEY_ID" key "$APP_KEY" > /dev/null || fallo "No se pudo configurar rclone"
+    rclone lsd b2: 2>/dev/null | grep -q " $BUCKET$" || fallo "rclone no ve el bucket '$BUCKET' (revisá el nombre y las claves)"
+    ok "rclone conectado al bucket '$BUCKET'"
+else
+    echo "  [AVISO] Sin datos de Backblaze: después corré 'sudo rclone config' y poné BUCKET en /usr/local/bin/backup.sh"
+fi
+
+# ==================== 9. RESPALDO + CRONTAB ====================
+paso "9/9 · PRIMER RESPALDO Y CRONTAB"
+( crontab -l 2>/dev/null | grep -v "backup.sh"; echo "$CRON" ) | crontab -
+ok "Crontab de root: $CRON"
+/usr/local/bin/backup.sh > /dev/null
+tail -n 4 /srv/tarea_final/respaldos/backup.log | sed 's/^/  /'
+
+# ==================== RESUMEN ====================
+echo
+linea
+centrar "INSTALACIÓN TERMINADA"
+linea
+echo
+echo "  App:         http://$DOMINIO"
+echo "  phpMyAdmin:  http://$DOMINIO/phpmyadmin  (usuario: admin)"
+echo "  Menú:        sudo menu.sh"
+echo "  IP del servidor (para el hosts de Windows): $(hostname -I | awk '{print $1}')"
+echo
